@@ -1,0 +1,140 @@
+function [u, ndof, I] = solveEvolutionS1adpExplicitEuler(meshdata, A, b, r, f, T, u_0, u_exact)
+% A, b, r, f the data of the Parabolic problem 
+% T the terminal time
+
+%% Space discretisation
+nElem = meshdata.nElem;
+nNodes = meshdata.nNodes;
+area4e = meshdata.area4e;
+c4e = meshdata.c4e;
+n4e = meshdata.n4e;
+c4n = meshdata.c4n;
+mid4e = meshdata.mid4e;
+
+% Evaluation of right-hand side f for midpoint quadrature rule,
+% meshdata.mid4e(nElem x 2, barycenter)
+f4e = f(meshdata.mid4e); % float x nElm
+r4e = r(meshdata.mid4e); % float x nElm
+b4e = b(meshdata.mid4e); % float x nElm x 2
+A4e = A(meshdata.mid4e); % float x nElm x 2 x 2
+
+% Pre-allocating variables
+L4e = zeros(3, 3, nElem); % The mass matrix in front of the derivative
+S4e = zeros(3, 3, nElem); % The local matrix that is multiplied by the vector
+R4e = zeros(3, nElem); % RHS of the equation system for dx
+
+% Computation of local matrices
+parfor j = 1:nElem
+    grads = [ones(1,3); c4e(:,:,j)] \ [zeros(1,2); eye(2)];
+    L4e(:,:,j) =  area4e(j) / 12 * (ones(3) + eye(3));
+    S4e(:,:,j) = area4e(j) * (grads * ( A4e(:, :, j) * grads')) + ...
+         grads * b4e(j, :)' * repmat(2/3 * area4e(j), 1, 3) + ...
+        r4e(j) * area4e(j) / 12 * (ones(3) + eye(3));
+    R4e(:,j) = f4e(j) * area4e(j) / 3 * ones(3, 1);
+end
+
+% Convert global into local degrees of freedom
+ColumnIndices4e = permute(repmat(n4e, 1, 1, 3), [3 2 1]);
+RowIndices4e = permute(ColumnIndices4e, [2 1 3]);
+Indices4e = permute(meshdata.n4e, [2 1]);
+
+% Assembling
+LHS = sparse(RowIndices4e(:), ColumnIndices4e(:), L4e(:), ...
+    nNodes, nNodes);
+S = sparse(RowIndices4e(:), ColumnIndices4e(:), S4e(:), ...
+    nNodes, nNodes);
+RHS = accumarray(Indices4e(:), R4e(:), [nNodes 1]);
+
+% Determining degrees of freedom
+dof = setdiff(1:nNodes, meshdata.DbNodes);
+ndof = length(dof);
+
+
+%% 3-stage Runge-Kutta Method with adaptive stepsize
+    function [x_1] = RK4(x_0, h)
+        k1 = -S * x_0;
+        k2 = -S * (x_0 + 0.5 * h * k1);
+        k3 = -S * (x_0 + 0.5 * h * k2);
+        k4 = -S * (x_0 + h * k3);
+        R_temp = LHS * x_0 + (1/6)*(k1 + 2*k2 + 2*k3 + k4)*h;
+        x_1(dof) = LHS(dof,dof) \ R_temp(dof);
+    end
+
+    function [x_1] = RK3(x_0, h)
+        k1 = -S * x_0;
+        k2 = -S * (x_0 + 1/3 * h * k1);
+        k3 = -S * (x_0 + 2/3 * h * k2);
+        R_temp = LHS * x_0 + (1/4) * h * k1 + (3/4) * h * k3;
+        x_1(dof) = LHS(dof,dof) \ R_temp(dof);
+    end 
+
+    function [t_1, x_1] =  RK3_adpt(t_0, x_0, h_0, alpha, tol)
+        x_RK3 = RK3(x_0, h_0);
+        x_RK4 = RK4(x_0, h_0);
+        eta = max(x_RK3 - x_RK4);
+        if eta < tol 
+            x_1 = x_RK3;
+            t_1 = t_0 + h_0;
+        else
+            h_0 = alpha * (tol/eta)^(1/4) * h_0;
+            x_1 = RK3(x_0, h_0);
+            t_1 = t_0 + h_0;
+        end
+    end 
+                   
+% start the iteration
+u_ini = zeros(nNodes, 1);
+for k = 1:nNodes
+    u_ini(k) = u_0(c4n(k, 1), c4n(k, 2));
+end
+
+t_0 = 0;
+h_0 = 0.0001;
+alpha = 0.9;
+tol = 0.01;
+u_temp = zeros(nNodes, 10^5);
+I_temp = zeros(1, 10^5);
+u_temp(:, 1) = u_ini;
+I_temp(1) = 0;
+j = 2;
+while t_0 < T
+    [I_temp(j), u_temp(:, j)] = RK3_adpt(I_temp(j-1), u_temp(:, j-1), h_0, alpha, tol);
+    t_0 = I_temp(j);
+    j = j + 1;
+end
+
+u = zeros(nNodes, j);
+I = zeros(1, j);
+for i = 1:j
+    u(:, i) = u_temp(:, i);
+    I(i) = I_temp(i);
+end
+
+
+%% Error Estimation
+% L2 norm
+err = 0;
+for k = 1: j
+    I_h = 0;
+    for l = 1: nElem
+        % average of the value of 3 vertex to represent the numerical midpont
+        u_h = (u(n4e(l,1), k) + u(n4e(l,2), k) + u(n4e(l,3), k))/3; 
+        I_h = I_h + (u_exact(I(k),mid4e(l, 1), mid4e(l, 2)) - u_h)^2 * area4e(l);
+    end
+    err = err + I_h * (I(k + 1) - I(k));
+end
+err = sqrt(err);
+
+% Calculate the error w.r.t. H1 semi-norm
+err_E = 0;
+for k = 1: (numSteps - 1)
+    u_exact_h = zeros(nNodes, 1);
+    for l = 1: nNodes
+        u_exact_h(l) = u_exact(I(k), c4n(l, 1), c4n(l, 2)); 
+    end
+    err_E = err_E + (u_exact_h - u(:, k))' * S * (u_exact_h - u(:, k)) * (I(k + 1) - I(k));
+end
+
+           
+end
+
