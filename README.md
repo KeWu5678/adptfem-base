@@ -1,1 +1,1 @@
-# adptfem-base
+# adaptive finite-element base solver
